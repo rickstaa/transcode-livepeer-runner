@@ -1,0 +1,75 @@
+# Offchain demo: orchestrator + the unified transcoding app (batch + live),
+# self-registering (dynamic) with capacity for concurrent jobs.
+#
+#   docker compose up -d --build
+#   # batch:
+#   uv run client.py clip.mp4 --heights 720,360
+#   # live (trickle):
+#   uv run client.py clip.mp4 --live --heights 720,360
+#
+# Self-contained on purpose: nothing is pulled in from a parent directory, so
+# this works wherever you copy it.
+# CPU codecs by default; for GPU set TRANSCODE_*_ENCODER=*_nvenc below, use a
+# CUDA ffmpeg base (README), and uncomment the reservation below. Batch jobs
+# round-robin across every GPU the container can see (nvidia-smi -L at
+# startup) via -gpu <index>, so `count: all` puts the whole box to work
+# instead of pinning every job to device 0.
+
+services:
+  orchestrator:
+    image: livepeer/go-livepeer:v0.9.1
+    container_name: transcode_orchestrator
+    # Two distinct addresses:
+    #   serviceAddr    advertised to external clients in discovery responses,
+    #                  so it must be reachable from the host (published port).
+    #   liveRunnerAddr control-plane URL runners use for heartbeat + trickle,
+    #                  so it must resolve on the compose network.
+    command:
+      - -orchestrator
+      - -useLiveRunners
+      - -serviceAddr=127.0.0.1:8935
+      - -httpAddr=0.0.0.0:8935
+      - -liveRunnerAddr=https://orchestrator:8935
+      - -orchSecret=abcdef
+      - -network=offchain
+      - -monitor=false
+      - -v=6
+    ports:
+      - "8935:8935"
+    # 8935 is HTTPS and the image has only openssl, no curl or wget. A raw TCP
+    # probe would open the socket without a handshake and log a TLS error every
+    # interval, so speak real TLS; matching "200 OK" also proves it is serving.
+    healthcheck:
+      test: printf 'GET /healthz HTTP/1.0\r\n\r\n' | openssl s_client -connect 127.0.0.1:8935 -quiet 2>/dev/null | grep -q '200 OK'
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+
+  app:
+    # `up` always builds; `--pull always` runs the published image instead.
+    image: ghcr.io/rickstaa/transcode-livepeer-runner:latest
+    pull_policy: build
+    build: .
+    container_name: transcode_app
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    command:
+      - python
+      - runner.py
+      - --host=0.0.0.0
+      - --orchestrator=https://orchestrator:8935
+      - --orchSecret=abcdef
+      - --runner-url=http://app:8990
+      - --capacity=${TRANSCODE_CAPACITY:-4}
+      - --av1-encoder=${TRANSCODE_AV1_ENCODER:-libsvtav1}
+      - --h264-encoder=${TRANSCODE_H264_ENCODER:-libx264}
+      - --h265-encoder=${TRANSCODE_H265_ENCODER:-libx265}
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
